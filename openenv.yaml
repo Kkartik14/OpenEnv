@@ -1,0 +1,16 @@
+name: sre_incident_env
+version: "1.0.0"
+description: >
+  SRE Incident Response Environment — an AI agent triages production incidents
+  in a simulated microservice architecture by reading logs, checking metrics,
+  tracing requests, diagnosing root causes, and applying remediations.
+tasks:
+  - name: single_service_failure
+    difficulty: easy
+    description: "Diagnose and fix a single service failure with clear log evidence"
+  - name: cascading_failure
+    difficulty: medium
+    description: "Identify root cause in a cascading multi-service failure"
+  - name: complex_failure
+    difficulty: hard
+    description: "Solve a complex incident with red herrings and intermittent failures"
