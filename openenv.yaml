@@ -1,5 +1,9 @@
+spec_version: 1
 name: sre_incident_env
-version: "1.0.0"
+type: space
+runtime: fastapi
+app: sre_incident_env.server.app:app
+port: 7860
 description: >
   SRE Incident Response Environment — an AI agent triages production incidents
   in a simulated microservice architecture by reading logs, checking metrics,

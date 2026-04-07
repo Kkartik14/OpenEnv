@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-server = "uvicorn:main"
+server = "server.app:main"
 
 [tool.setuptools.packages.find]
 include = ["sre_incident_env*"]

@@ -18,14 +18,20 @@ import os
 import re
 import sys
 import textwrap
+import traceback
 
 from openai import OpenAI
 
 from sre_incident_env import SREIncidentAction, SREIncidentEnvironment
 
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+if HF_TOKEN is None:
+    raise ValueError("HF_TOKEN environment variable is required")
+
+client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
 BENCHMARK = "sre_incident_env"
 TASKS = [
@@ -34,7 +40,6 @@ TASKS = [
     {"task": "hard", "scenario_id": "h1_tls_cert_expiry", "label": "complex_failure"},
 ]
 
-MAX_STEPS_OVERRIDE = None
 TEMPERATURE = 0.3
 MAX_TOKENS = 512
 SUCCESS_THRESHOLD = 0.5
@@ -129,77 +134,79 @@ def run_episode(task_cfg: dict) -> float:
     scenario_id = task_cfg["scenario_id"]
     label = task_cfg["label"]
 
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     env = SREIncidentEnvironment()
 
     log_start(task=label, env=BENCHMARK, model=MODEL_NAME)
 
-    obs = env.reset(task=task, scenario_id=scenario_id, seed=42)
-    max_steps = MAX_STEPS_OVERRIDE or obs.max_steps
     rewards = []
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": build_user_message(obs)},
-    ]
-
     last_error = None
-    for step_num in range(1, max_steps + 1):
-        try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
+
+    try:
+        obs = env.reset(task=task, scenario_id=scenario_id, seed=42)
+        max_steps = obs.max_steps
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_message(obs)},
+        ]
+
+        for step_num in range(1, max_steps + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                )
+                raw_output = response.choices[0].message.content or ""
+            except Exception as e:
+                raw_output = ""
+                last_error = str(e)
+                log_step(step_num, "llm_error", 0.0, False, last_error)
+                rewards.append(0.0)
+                continue
+
+            try:
+                action = parse_action(raw_output)
+                last_error = None
+            except Exception:
+                action = SREIncidentAction(
+                    action_type="query_logs",
+                    target_service="api-gateway",
+                    params={"severity": "ERROR"},
+                )
+                last_error = f"parse_error: {raw_output[:120]}"
+
+            action_str = (
+                f"{action.action_type}("
+                f"{action.target_service or ''}"
+                f"{', ' + json.dumps(action.params) if action.params else ''}"
+                f")"
             )
-            raw_output = response.choices[0].message.content or ""
-        except Exception as e:
-            raw_output = ""
-            last_error = str(e)
-            log_step(step_num, "llm_error", 0.0, False, last_error)
-            rewards.append(0.0)
-            continue
 
-        try:
-            action = parse_action(raw_output)
-        except Exception:
-            action = SREIncidentAction(
-                action_type="query_logs",
-                target_service="api-gateway",
-                params={"severity": "ERROR"},
-            )
-            last_error = f"parse_error: {raw_output[:120]}"
+            obs = env.step(action)
+            reward = obs.reward if obs.reward is not None else 0.0
+            rewards.append(reward)
 
-        action_str = (
-            f"{action.action_type}("
-            f"{action.target_service or ''}"
-            f"{', ' + json.dumps(action.params) if action.params else ''}"
-            f")"
-        )
+            log_step(step_num, action_str, reward, obs.done, last_error)
+            last_error = None
 
-        obs = env.step(action)
-        reward = obs.reward if obs.reward is not None else 0.0
-        rewards.append(reward)
-        last_error = None
+            messages.append({"role": "assistant", "content": raw_output})
+            messages.append({"role": "user", "content": build_user_message(obs)})
 
-        log_step(step_num, action_str, reward, obs.done, last_error)
+            if obs.done:
+                break
 
-        messages.append({"role": "assistant", "content": raw_output})
-        messages.append({"role": "user", "content": build_user_message(obs)})
-
-        if obs.done:
-            break
-
-    final_reward = rewards[-1] if rewards else 0.0
-    success = final_reward >= SUCCESS_THRESHOLD
-    log_end(success=success, steps=len(rewards), rewards=rewards)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+    finally:
+        final_reward = rewards[-1] if rewards else 0.0
+        success = final_reward >= SUCCESS_THRESHOLD
+        log_end(success=success, steps=len(rewards), rewards=rewards)
 
     return final_reward
 
 
 def main():
-    if not API_KEY:
-        print("WARNING: No API key set. Set HF_TOKEN or API_KEY.", file=sys.stderr)
-
     results = {}
     for task_cfg in TASKS:
         score = run_episode(task_cfg)
