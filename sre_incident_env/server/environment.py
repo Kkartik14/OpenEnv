@@ -24,6 +24,15 @@ AVAILABLE_ACTIONS = [
     "remediate(params={action, target})",
 ]
 
+TASK_NAME_TO_DIFFICULTY: Dict[str, str] = {
+    "single_service_failure": "easy",
+    "cascading_failure": "medium",
+    "complex_failure": "hard",
+    "easy": "easy",
+    "medium": "medium",
+    "hard": "hard",
+}
+
 
 class SREIncidentEnvironment(
     Environment[SREIncidentAction, SREIncidentObservation, SREIncidentState]
@@ -59,7 +68,7 @@ class SREIncidentEnvironment(
         if scenario_id and scenario_id in ALL_SCENARIO_IDS:
             self._scenario = ALL_SCENARIO_IDS[scenario_id]
         else:
-            difficulty = task if task in SCENARIOS else "easy"
+            difficulty = TASK_NAME_TO_DIFFICULTY.get(task, "easy")
             self._scenario = random.choice(SCENARIOS[difficulty])
 
         self._base_time = datetime.now(timezone.utc)
