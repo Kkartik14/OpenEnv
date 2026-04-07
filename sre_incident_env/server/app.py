@@ -10,3 +10,20 @@ app = create_fastapi_app(
     action_cls=SREIncidentAction,
     observation_cls=SREIncidentObservation,
 )
+
+
+@app.get("/")
+def root():
+    return {
+        "environment": "SRE Incident Response Environment",
+        "status": "running",
+        "endpoints": {
+            "health": "/health",
+            "reset": "/reset",
+            "step": "/step",
+            "state": "/state",
+            "schema": "/schema",
+            "metadata": "/metadata",
+            "docs": "/docs",
+        },
+    }
