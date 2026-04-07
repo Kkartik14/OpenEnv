@@ -1,9 +1,9 @@
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel
+from openenv.core.env_server import Action, Observation, State
 
 
-class SREIncidentAction(BaseModel):
+class SREIncidentAction(Action):
     """Action the agent can take in the incident response environment."""
 
     action_type: str
@@ -11,27 +11,29 @@ class SREIncidentAction(BaseModel):
     params: Optional[Dict[str, Any]] = None
 
 
-class SREIncidentObservation(BaseModel):
-    """Observation returned after each step."""
+class SREIncidentObservation(Observation):
+    """Observation returned after each step.
 
-    done: bool = False
-    reward: Optional[float] = None
-    system_status: Dict[str, Dict[str, Any]]
-    active_alerts: List[Dict[str, str]]
-    action_result: str
-    message: str
-    step_number: int
-    max_steps: int
-    available_actions: List[str]
+    Inherits from Observation: done (bool), reward (Optional[float]), metadata (dict).
+    """
+
+    system_status: Dict[str, Dict[str, Any]] = {}
+    active_alerts: List[Dict[str, str]] = []
+    action_result: str = ""
+    message: str = ""
+    step_number: int = 0
+    max_steps: int = 25
+    available_actions: List[str] = []
     diagnosis_submitted: bool = False
     incident_summary: str = ""
 
 
-class SREIncidentState(BaseModel):
-    """Internal state of the environment episode."""
+class SREIncidentState(State):
+    """Internal state of the environment episode.
 
-    episode_id: Optional[str] = None
-    step_count: int = 0
+    Inherits from State: episode_id (Optional[str]), step_count (int).
+    """
+
     task_name: str = ""
     difficulty: str = ""
     scenario_id: str = ""

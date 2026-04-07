@@ -9,6 +9,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from openenv.core.env_server import Environment
+
 from ..models import SREIncidentAction, SREIncidentObservation, SREIncidentState
 from .scenarios import ALL_SCENARIO_IDS, SCENARIOS, SERVICES, VALID_REMEDIATIONS
 
@@ -23,7 +25,9 @@ AVAILABLE_ACTIONS = [
 ]
 
 
-class SREIncidentEnvironment:
+class SREIncidentEnvironment(
+    Environment[SREIncidentAction, SREIncidentObservation, SREIncidentState]
+):
     SUPPORTS_CONCURRENT_SESSIONS = True
 
     def __init__(self):
