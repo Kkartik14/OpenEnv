@@ -44,6 +44,10 @@ TEMPERATURE = 0.3
 MAX_TOKENS = 512
 SUCCESS_THRESHOLD = 0.5
 
+
+def clamp_reward(r: float) -> float:
+    return round(max(0.10, min(0.90, r)), 2)
+
 SYSTEM_PROMPT = textwrap.dedent("""\
     You are an expert SRE engineer responding to a production incident in a
     microservice architecture. Your goal: identify the root cause and apply
@@ -161,8 +165,8 @@ def run_episode(task_cfg: dict) -> float:
             except Exception as e:
                 raw_output = ""
                 last_error = str(e)
-                log_step(step_num, "llm_error", 0.0, False, last_error)
-                rewards.append(0.0)
+                log_step(step_num, "llm_error", clamp_reward(0.0), False, last_error)
+                rewards.append(clamp_reward(0.0))
                 continue
 
             try:
@@ -184,7 +188,7 @@ def run_episode(task_cfg: dict) -> float:
             )
 
             obs = env.step(action)
-            reward = obs.reward if obs.reward is not None else 0.0
+            reward = clamp_reward(obs.reward if obs.reward is not None else 0.10)
             rewards.append(reward)
 
             log_step(step_num, action_str, reward, obs.done, last_error)
@@ -199,7 +203,7 @@ def run_episode(task_cfg: dict) -> float:
     except Exception:
         traceback.print_exc(file=sys.stderr)
     finally:
-        final_reward = rewards[-1] if rewards else 0.0
+        final_reward = rewards[-1] if rewards else clamp_reward(0.0)
         success = final_reward >= SUCCESS_THRESHOLD
         log_end(success=success, steps=len(rewards), rewards=rewards)
 

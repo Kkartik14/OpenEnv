@@ -144,7 +144,7 @@ class SREIncidentEnvironment(
             self._step_rewards.append(terminal_reward)
             reward = terminal_reward
         else:
-            reward = round(max(0.01, min(0.99, step_reward)), 2)
+            reward = round(max(0.10, min(0.90, step_reward)), 2)
             self._step_rewards.append(reward)
 
         return SREIncidentObservation(
@@ -521,7 +521,7 @@ class SREIncidentEnvironment(
         if self._penalties == 0:
             reward += 0.05
 
-        return round(max(0.01, min(0.99, reward)), 2)
+        return round(max(0.10, min(0.90, reward)), 2)
 
     # ------------------------------------------------------------------
     # Formatting helpers
