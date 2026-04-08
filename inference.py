@@ -14,6 +14,7 @@ STDOUT FORMAT
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -45,8 +46,16 @@ MAX_TOKENS = 512
 SUCCESS_THRESHOLD = 0.5
 
 
-def clamp_reward(r: float) -> float:
-    return round(max(0.10, min(0.90, r)), 2)
+def clamp_reward(r):
+    if r is None or not isinstance(r, (int, float)) or math.isnan(r) or math.isinf(r):
+        return 0.10
+    return round(max(0.10, min(0.90, float(r))), 2)
+
+
+def sanitize(s):
+    """Remove newlines and control characters so [STEP] stays on one line."""
+    return str(s).replace("\n", " ").replace("\r", "")[:200]
+
 
 SYSTEM_PROMPT = textwrap.dedent("""\
     You are an expert SRE engineer responding to a production incident in a
@@ -89,10 +98,11 @@ def log_start(task: str, env: str, model: str):
 
 
 def log_step(step: int, action_str: str, reward: float, done: bool, error):
-    err = "null" if error is None else str(error)
+    err = "null" if error is None else sanitize(error)
     d = "true" if done else "false"
+    r = clamp_reward(reward)
     print(
-        f"[STEP] step={step} action={action_str} reward={reward:.2f} "
+        f"[STEP] step={step} action={sanitize(action_str)} reward={r:.2f} "
         f"done={d} error={err}",
         flush=True,
     )
@@ -100,7 +110,7 @@ def log_step(step: int, action_str: str, reward: float, done: bool, error):
 
 def log_end(success: bool, steps: int, rewards: list):
     s = "true" if success else "false"
-    r_str = ",".join(f"{r:.2f}" for r in rewards)
+    r_str = ",".join(f"{clamp_reward(r):.2f}" for r in rewards)
     print(f"[END] success={s} steps={steps} rewards={r_str}", flush=True)
 
 
@@ -165,8 +175,9 @@ def run_episode(task_cfg: dict) -> float:
             except Exception as e:
                 raw_output = ""
                 last_error = str(e)
-                log_step(step_num, "llm_error", clamp_reward(0.0), False, last_error)
-                rewards.append(clamp_reward(0.0))
+                r = clamp_reward(0.0)
+                log_step(step_num, "llm_error", r, False, last_error)
+                rewards.append(r)
                 continue
 
             try:
@@ -178,17 +189,12 @@ def run_episode(task_cfg: dict) -> float:
                     target_service="api-gateway",
                     params={"severity": "ERROR"},
                 )
-                last_error = f"parse_error: {raw_output[:120]}"
+                last_error = "parse_error"
 
-            action_str = (
-                f"{action.action_type}("
-                f"{action.target_service or ''}"
-                f"{', ' + json.dumps(action.params) if action.params else ''}"
-                f")"
-            )
+            action_str = f"{action.action_type}({action.target_service or ''})"
 
             obs = env.step(action)
-            reward = clamp_reward(obs.reward if obs.reward is not None else 0.10)
+            reward = clamp_reward(obs.reward)
             rewards.append(reward)
 
             log_step(step_num, action_str, reward, obs.done, last_error)
@@ -211,19 +217,8 @@ def run_episode(task_cfg: dict) -> float:
 
 
 def main():
-    results = {}
     for task_cfg in TASKS:
-        score = run_episode(task_cfg)
-        results[task_cfg["label"]] = score
-        print(flush=True)
-
-    print("\n=== SUMMARY ===", flush=True)
-    for label, score in results.items():
-        status = "PASS" if score >= SUCCESS_THRESHOLD else "FAIL"
-        print(f"  {label:30s} {score:.2f}  [{status}]", flush=True)
-
-    avg = sum(results.values()) / len(results) if results else 0
-    print(f"\n  {'Average':30s} {avg:.2f}", flush=True)
+        run_episode(task_cfg)
 
 
 if __name__ == "__main__":
