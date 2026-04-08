@@ -2,6 +2,12 @@
 Core SRE Incident Response Environment.
 
 Implements reset(), step(), and state for the OpenEnv spec.
+
+Reward design:
+  Every step returns a meaningful reward in (0.10, 0.90).
+  The terminal step uses a trajectory grader that considers the full
+  episode: diagnosis accuracy, remediation correctness, investigation
+  quality, efficiency, and catastrophic-failure penalties.
 """
 
 import random
@@ -33,6 +39,18 @@ TASK_NAME_TO_DIFFICULTY: Dict[str, str] = {
     "hard": "hard",
 }
 
+# Per-step reward tiers — every action gets a score the agent can learn from
+REWARD_EXCELLENT = 0.85       # investigated the right service with best tool
+REWARD_GOOD = 0.65            # investigated a relevant service
+REWARD_NEUTRAL = 0.45         # investigated an irrelevant but valid service
+REWARD_POOR = 0.25            # wasted step (no request_id, health check on healthy svc)
+REWARD_BAD = 0.15             # repeated action or invalid input
+REWARD_CATASTROPHIC = 0.10    # remediated without diagnosing first
+
+
+def _clamp(r: float) -> float:
+    return round(max(0.10, min(0.90, r)), 2)
+
 
 class SREIncidentEnvironment(
     Environment[SREIncidentAction, SREIncidentObservation, SREIncidentState]
@@ -47,8 +65,8 @@ class SREIncidentEnvironment(
         self._services_investigated: Set[str] = set()
         self._diagnosis: Optional[Dict[str, str]] = None
         self._remediation: Optional[Dict[str, str]] = None
-        self._penalties: float = 0.0
         self._step_rewards: List[float] = []
+        self._step_categories: List[str] = []
 
     # ------------------------------------------------------------------
     # OpenEnv interface
@@ -76,8 +94,8 @@ class SREIncidentEnvironment(
         self._services_investigated = set()
         self._diagnosis = None
         self._remediation = None
-        self._penalties = 0.0
         self._step_rewards = []
+        self._step_categories = []
 
         self._state = SREIncidentState(
             episode_id=episode_id or str(uuid.uuid4()),
@@ -127,10 +145,14 @@ class SREIncidentEnvironment(
         max_steps = self._scenario["max_steps"]
 
         action_key = self._action_signature(action)
-        is_repeat = action_key in [self._action_signature_from_dict(a) for a in self._actions_taken]
+        is_repeat = action_key in [
+            self._action_signature_from_dict(a) for a in self._actions_taken
+        ]
         self._actions_taken.append(action.model_dump())
 
-        result_text, step_reward, message = self._process_action(action, is_repeat)
+        result_text, step_reward, message, category = self._process_action(
+            action, is_repeat
+        )
 
         done = False
         if self._remediation is not None:
@@ -140,12 +162,12 @@ class SREIncidentEnvironment(
             message = "Maximum steps reached. Episode ending."
 
         if done:
-            terminal_reward = self._calculate_terminal_reward()
-            self._step_rewards.append(terminal_reward)
-            reward = terminal_reward
+            reward = self._trajectory_grade()
         else:
-            reward = round(max(0.10, min(0.90, step_reward)), 2)
-            self._step_rewards.append(reward)
+            reward = _clamp(step_reward)
+
+        self._step_rewards.append(reward)
+        self._step_categories.append(category)
 
         return SREIncidentObservation(
             done=done,
@@ -166,12 +188,12 @@ class SREIncidentEnvironment(
         return self._state
 
     # ------------------------------------------------------------------
-    # Action processing
+    # Action processing — each returns (text, reward, message, category)
     # ------------------------------------------------------------------
 
     def _process_action(
         self, action: SREIncidentAction, is_repeat: bool
-    ) -> Tuple[str, float, str]:
+    ) -> Tuple[str, float, str, str]:
         atype = action.action_type.lower().strip()
         handlers = {
             "query_logs": self._handle_query_logs,
@@ -188,28 +210,30 @@ class SREIncidentEnvironment(
             return (
                 f"Unknown action type: '{atype}'. "
                 f"Valid actions: {', '.join(handlers.keys())}",
-                0.0,
+                REWARD_BAD,
                 "Invalid action. Please use a valid action type.",
+                "invalid",
             )
 
-        result_text, base_reward, message = handler(action)
+        result_text, base_reward, message, category = handler(action)
 
         if is_repeat and atype not in ("diagnose", "remediate"):
-            self._penalties -= 0.01
-            base_reward = max(base_reward - 0.01, -0.01)
-            message += " (repeated action — small penalty)"
+            base_reward = REWARD_BAD
+            category = "repeat"
+            message += " (repeated action — penalty)"
 
-        return result_text, base_reward, message
+        return result_text, base_reward, message, category
 
     def _handle_query_logs(
         self, action: SREIncidentAction
-    ) -> Tuple[str, float, str]:
+    ) -> Tuple[str, float, str, str]:
         service = action.target_service
         if not service or service not in SERVICES:
             return (
                 f"Service '{service}' not found. Available: {', '.join(SERVICES)}",
-                0.0,
+                REWARD_BAD,
                 "Invalid service name.",
+                "invalid",
             )
 
         self._services_investigated.add(service)
@@ -243,18 +267,20 @@ class SREIncidentEnvironment(
             )
 
         is_relevant = service in self._scenario.get("relevant_services", set())
-        reward = 0.02 if is_relevant else 0.0
-        return result, reward, f"Queried logs from {service}."
+        if is_relevant:
+            return result, REWARD_EXCELLENT, f"Queried logs from {service}.", "excellent"
+        return result, REWARD_NEUTRAL, f"Queried logs from {service}.", "neutral"
 
     def _handle_check_metrics(
         self, action: SREIncidentAction
-    ) -> Tuple[str, float, str]:
+    ) -> Tuple[str, float, str, str]:
         service = action.target_service
         if not service or service not in SERVICES:
             return (
                 f"Service '{service}' not found. Available: {', '.join(SERVICES)}",
-                0.0,
+                REWARD_BAD,
                 "Invalid service name.",
+                "invalid",
             )
 
         self._services_investigated.add(service)
@@ -285,12 +311,13 @@ class SREIncidentEnvironment(
             result = "\n".join(lines)
 
         is_relevant = service in self._scenario.get("relevant_services", set())
-        reward = 0.02 if is_relevant else 0.0
-        return result, reward, f"Checked metrics for {service}."
+        if is_relevant:
+            return result, REWARD_GOOD, f"Checked metrics for {service}.", "good"
+        return result, REWARD_NEUTRAL, f"Checked metrics for {service}.", "neutral"
 
     def _handle_trace_request(
         self, action: SREIncidentAction
-    ) -> Tuple[str, float, str]:
+    ) -> Tuple[str, float, str, str]:
         params = action.params or {}
         request_id = params.get("request_id", "")
 
@@ -301,10 +328,11 @@ class SREIncidentEnvironment(
                 return (
                     f"No request_id specified. Available trace IDs from recent errors:\n"
                     f"  {', '.join(available)}",
-                    0.0,
+                    REWARD_POOR,
                     "Provide a request_id in params to trace.",
+                    "poor",
                 )
-            return "No traces available for this incident.", 0.0, "No traces found."
+            return "No traces available for this incident.", REWARD_POOR, "No traces found.", "poor"
 
         trace_spans = traces.get(request_id)
         if not trace_spans:
@@ -312,8 +340,9 @@ class SREIncidentEnvironment(
             hint = f" Available: {', '.join(available)}" if available else ""
             return (
                 f"Trace '{request_id}' not found.{hint}",
-                0.0,
+                REWARD_POOR,
                 "Trace ID not found.",
+                "poor",
             )
 
         lines = [f"=== Trace: {request_id} ===\n"]
@@ -326,17 +355,18 @@ class SREIncidentEnvironment(
                 f"status={status}\n     {span['detail']}"
             )
         result = "\n\n".join(lines)
-        return result, 0.03, f"Traced request {request_id}."
+        return result, REWARD_EXCELLENT, f"Traced request {request_id}.", "excellent"
 
     def _handle_check_deployments(
         self, action: SREIncidentAction
-    ) -> Tuple[str, float, str]:
+    ) -> Tuple[str, float, str, str]:
         service = action.target_service
         if not service or service not in SERVICES:
             return (
                 f"Service '{service}' not found. Available: {', '.join(SERVICES)}",
-                0.0,
+                REWARD_BAD,
                 "Invalid service name.",
+                "invalid",
             )
 
         self._services_investigated.add(service)
@@ -363,18 +393,20 @@ class SREIncidentEnvironment(
             result = "\n\n".join(lines)
 
         is_relevant = service in self._scenario.get("relevant_services", set())
-        reward = 0.01 if is_relevant else 0.0
-        return result, reward, f"Checked deployment history for {service}."
+        if is_relevant:
+            return result, REWARD_GOOD, f"Checked deployment history for {service}.", "good"
+        return result, REWARD_NEUTRAL, f"Checked deployment history for {service}.", "neutral"
 
     def _handle_run_health_check(
         self, action: SREIncidentAction
-    ) -> Tuple[str, float, str]:
+    ) -> Tuple[str, float, str, str]:
         service = action.target_service
         if not service or service not in SERVICES:
             return (
                 f"Service '{service}' not found. Available: {', '.join(SERVICES)}",
-                0.0,
+                REWARD_BAD,
                 "Invalid service name.",
+                "invalid",
             )
 
         self._services_investigated.add(service)
@@ -393,19 +425,21 @@ class SREIncidentEnvironment(
         )
 
         is_relevant = service in self._scenario.get("relevant_services", set())
-        reward = 0.01 if is_relevant else 0.0
-        return result, reward, f"Health check for {service}: {status}."
+        if is_relevant:
+            return result, REWARD_GOOD, f"Health check for {service}: {status}.", "good"
+        return result, REWARD_POOR, f"Health check for {service}: {status}.", "poor"
 
     def _handle_diagnose(
         self, action: SREIncidentAction
-    ) -> Tuple[str, float, str]:
+    ) -> Tuple[str, float, str, str]:
         if self._diagnosis is not None:
             return (
                 "Diagnosis already submitted. You cannot change your diagnosis.\n"
                 f"Current diagnosis: root_cause={self._diagnosis['root_cause']}, "
                 f"affected_service={self._diagnosis['affected_service']}",
-                0.0,
+                REWARD_BAD,
                 "Diagnosis already locked in.",
+                "repeat",
             )
 
         params = action.params or {}
@@ -420,6 +454,18 @@ class SREIncidentEnvironment(
         }
         self._state.diagnosed = True
 
+        correct_rc = self._scenario["root_cause"]
+        correct_svc = self._scenario["affected_service"]
+        rc_correct = root_cause == correct_rc
+        svc_correct = affected_service == correct_svc
+
+        if rc_correct and svc_correct:
+            reward, cat = REWARD_EXCELLENT, "excellent"
+        elif rc_correct or svc_correct:
+            reward, cat = REWARD_GOOD, "good"
+        else:
+            reward, cat = REWARD_POOR, "poor"
+
         result = (
             f"=== Diagnosis Submitted ===\n\n"
             f"  Root Cause:       {root_cause}\n"
@@ -427,11 +473,11 @@ class SREIncidentEnvironment(
             f"  Explanation:      {explanation}\n\n"
             f"Diagnosis locked. Now apply remediation with the 'remediate' action."
         )
-        return result, 0.0, "Diagnosis submitted. Proceed to remediation."
+        return result, reward, "Diagnosis submitted. Proceed to remediation.", cat
 
     def _handle_remediate(
         self, action: SREIncidentAction
-    ) -> Tuple[str, float, str]:
+    ) -> Tuple[str, float, str, str]:
         params = action.params or {}
         rem_action = params.get("action", "")
         rem_target = params.get("target", "")
@@ -440,35 +486,52 @@ class SREIncidentEnvironment(
             return (
                 f"Invalid remediation action: '{rem_action}'. "
                 f"Valid actions: {', '.join(VALID_REMEDIATIONS)}",
-                0.0,
+                REWARD_BAD,
                 "Invalid remediation action.",
+                "invalid",
             )
         if rem_target not in SERVICES:
             return (
                 f"Invalid target service: '{rem_target}'. "
                 f"Available: {', '.join(SERVICES)}",
-                0.0,
+                REWARD_BAD,
                 "Invalid target service.",
+                "invalid",
             )
 
-        if self._diagnosis is None:
-            self._penalties -= 0.10
-            message = "WARNING: Remediation applied without prior diagnosis (penalty applied)."
+        no_diagnosis = self._diagnosis is None
+        if no_diagnosis:
+            message = "WARNING: Remediation applied without prior diagnosis (catastrophic penalty)."
+            cat = "catastrophic"
         else:
             message = "Remediation applied."
+            cat = "good"
 
         self._remediation = {"action": rem_action, "target": rem_target}
         self._state.remediated = True
 
         correct = self._scenario["correct_remediation"]
-        if rem_action == correct["action"] and rem_target == correct["target"]:
+        correct_action = rem_action == correct["action"] and rem_target == correct["target"]
+
+        if correct_action and not no_diagnosis:
+            reward = REWARD_EXCELLENT
+            cat = "excellent"
             result = (
                 f"=== Remediation Applied ===\n\n"
                 f"  Action: {rem_action}\n"
                 f"  Target: {rem_target}\n\n"
                 f"Remediation executed successfully. Monitoring for recovery..."
             )
+        elif no_diagnosis:
+            reward = REWARD_CATASTROPHIC
+            result = (
+                f"=== Remediation Applied ===\n\n"
+                f"  Action: {rem_action}\n"
+                f"  Target: {rem_target}\n\n"
+                f"Remediation applied WITHOUT diagnosis. This is dangerous."
+            )
         else:
+            reward = REWARD_POOR
             result = (
                 f"=== Remediation Applied ===\n\n"
                 f"  Action: {rem_action}\n"
@@ -476,52 +539,60 @@ class SREIncidentEnvironment(
                 f"Remediation executed. Awaiting results..."
             )
 
-        return result, 0.0, message
+        return result, reward, message, cat
 
     # ------------------------------------------------------------------
-    # Reward calculation
+    # Trajectory grader
     # ------------------------------------------------------------------
 
-    def _calculate_terminal_reward(self) -> float:
-        reward = 0.0
+    def _trajectory_grade(self) -> float:
+        """Non-linear trajectory grader that adjusts the final score based on
+        the full episode history: diagnosis accuracy, remediation correctness,
+        investigation quality, efficiency, and catastrophic penalties."""
 
-        if self._diagnosis:
-            if self._diagnosis["root_cause"] == self._scenario["root_cause"]:
-                reward += 0.35
-            if self._diagnosis["affected_service"] == self._scenario["affected_service"]:
-                reward += 0.15
+        if not self._step_rewards:
+            return _clamp(0.10)
 
-        if self._remediation:
-            correct = self._scenario["correct_remediation"]
-            if (
-                self._remediation["action"] == correct["action"]
-                and self._remediation["target"] == correct["target"]
-            ):
-                reward += 0.20
+        mean_reward = sum(self._step_rewards) / len(self._step_rewards)
 
-        reward += self._penalties
+        # --- Catastrophic penalty: remediated without diagnosing ---
+        catastrophic_count = self._step_categories.count("catastrophic")
+        difficulty = self._scenario.get("difficulty", "easy")
+        catastrophic_penalty = 0.0
+        if catastrophic_count > 0:
+            penalty_by_diff = {"easy": -0.30, "medium": -0.40, "hard": -0.50}
+            catastrophic_penalty = penalty_by_diff.get(difficulty, -0.30)
 
+        # --- Consistency bonus: >=60% of steps are good/excellent ---
+        good_steps = sum(
+            1 for c in self._step_categories if c in ("excellent", "good")
+        )
+        consistency_ratio = good_steps / len(self._step_categories)
+        consistency_bonus = 0.0
+        if consistency_ratio >= 0.60:
+            bonus_by_diff = {"easy": 0.05, "medium": 0.08, "hard": 0.12}
+            consistency_bonus = bonus_by_diff.get(difficulty, 0.05)
+
+        # --- Efficiency bonus: solved within expected steps ---
         expected = self._scenario.get("expected_steps", 10)
         actual = self._state.step_count
+        efficiency_bonus = 0.0
         if actual <= expected:
-            reward += 0.10
+            efficiency_bonus = 0.05
         elif actual <= expected * 1.5:
             ratio = 1.0 - (actual - expected) / (expected * 0.5)
-            reward += 0.10 * max(ratio, 0)
+            efficiency_bonus = 0.05 * max(ratio, 0)
 
+        # --- Evidence bonus: investigated relevant services ---
         relevant = self._scenario.get("relevant_services", set())
+        evidence_bonus = 0.0
         if relevant:
-            investigated_relevant = self._services_investigated & relevant
-            evidence_ratio = len(investigated_relevant) / len(relevant)
-            reward += 0.10 * evidence_ratio
+            investigated = self._services_investigated & relevant
+            evidence_bonus = 0.05 * (len(investigated) / len(relevant))
 
-        if len(self._services_investigated) >= 2:
-            reward += 0.05
+        score = mean_reward + catastrophic_penalty + consistency_bonus + efficiency_bonus + evidence_bonus
 
-        if self._penalties == 0:
-            reward += 0.05
-
-        return round(max(0.10, min(0.90, reward)), 2)
+        return _clamp(score)
 
     # ------------------------------------------------------------------
     # Formatting helpers

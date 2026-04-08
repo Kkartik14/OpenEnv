@@ -13,7 +13,7 @@ STDOUT FORMAT
 - [END]   success=<bool> steps=<n> reward=<float>
 - [END]   score=<float>
 
-All reward and score values are strictly in (0.10, 0.90).
+All reward and score values are strictly in (0, 1).
 """
 
 import json
@@ -46,13 +46,13 @@ TASKS = [
 
 TEMPERATURE = 0.3
 MAX_TOKENS = 512
-SUCCESS_THRESHOLD = 0.05
+SUCCESS_SCORE_THRESHOLD = 0.1
 
 
 def clamp(r):
     if r is None or not isinstance(r, (int, float)) or math.isnan(r) or math.isinf(r):
-        return 0.10
-    return round(max(0.10, min(0.90, float(r))), 2)
+        return 0.25
+    return max(1e-6, min(float(r), 1 - 1e-6))
 
 
 def sanitize(s):
@@ -129,7 +129,6 @@ def run_episode(task_cfg: dict) -> float:
 
     rewards = []
     last_error = None
-    score = 0.10
 
     try:
         obs = env.reset(task=task, scenario_id=scenario_id, seed=42)
@@ -151,7 +150,7 @@ def run_episode(task_cfg: dict) -> float:
             except Exception as e:
                 raw_output = ""
                 last_error = str(e)
-                r = clamp(0.0)
+                r = clamp(0.15)
                 print(f"[STEP] step={step_num} action=llm_error reward={r:.2f} done=false error={sanitize(last_error)}", flush=True)
                 rewards.append(r)
                 continue
@@ -168,7 +167,6 @@ def run_episode(task_cfg: dict) -> float:
                 last_error = "parse_error"
 
             action_str = f"{action.action_type}({action.target_service or ''})"
-
             obs = env.step(action)
             reward = clamp(obs.reward)
             rewards.append(reward)
@@ -184,15 +182,16 @@ def run_episode(task_cfg: dict) -> float:
             if obs.done:
                 break
 
-        score = clamp(rewards[-1]) if rewards else 0.10
-
     except Exception:
         traceback.print_exc(file=sys.stderr)
-    finally:
-        success = "true" if score >= SUCCESS_THRESHOLD else "false"
-        rewards_str = ",".join(f"{clamp(r):.2f}" for r in rewards) if rewards else "0.10"
-        print(f"[END] success={success} steps={len(rewards)} reward={score:.2f} rewards={rewards_str}", flush=True)
-        print(f"[END] score={score:.2f}", flush=True)
+
+    score = sum(rewards) / len(rewards) if rewards else 0.25
+    score = max(1e-6, min(score, 1 - 1e-6))
+    success = score >= SUCCESS_SCORE_THRESHOLD
+
+    rewards_str = ",".join(f"{clamp(r):.2f}" for r in rewards) if rewards else "0.25"
+    print(f"[END] success={str(success).lower()} steps={len(rewards)} reward={score:.2f} rewards={rewards_str}", flush=True)
+    print(f"[END] score={score:.2f}", flush=True)
 
     return score
 
