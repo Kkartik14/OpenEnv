@@ -11,6 +11,9 @@ STDOUT FORMAT
 - [START] task=<task_name> env=<benchmark> model=<model_name>
 - [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
 - [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
+- [END]   score=<float>
+
+All reward and score values are strictly in (0.10, 0.90).
 """
 
 import json
@@ -114,6 +117,10 @@ def log_end(success: bool, steps: int, rewards: list):
     print(f"[END] success={s} steps={steps} rewards={r_str}", flush=True)
 
 
+def log_task_score(score: float):
+    print(f"[END] score={clamp_reward(score):.2f}", flush=True)
+
+
 def parse_action(text: str) -> SREIncidentAction:
     """Best-effort extraction of a JSON action from LLM output."""
     text = text.strip()
@@ -154,6 +161,7 @@ def run_episode(task_cfg: dict) -> float:
 
     rewards = []
     last_error = None
+    score = 0.10
 
     try:
         obs = env.reset(task=task, scenario_id=scenario_id, seed=42)
@@ -206,14 +214,17 @@ def run_episode(task_cfg: dict) -> float:
             if obs.done:
                 break
 
+        score = rewards[-1] if rewards else 0.10
+        score = clamp_reward(score)
+
     except Exception:
         traceback.print_exc(file=sys.stderr)
     finally:
-        final_reward = rewards[-1] if rewards else clamp_reward(0.0)
-        success = final_reward >= SUCCESS_THRESHOLD
+        success = score >= SUCCESS_THRESHOLD
         log_end(success=success, steps=len(rewards), rewards=rewards)
+        log_task_score(score)
 
-    return final_reward
+    return score
 
 
 def main():
