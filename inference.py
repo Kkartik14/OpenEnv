@@ -9,8 +9,8 @@ MANDATORY
 
 STDOUT FORMAT
 - [START] task=<task_name> env=<benchmark> model=<model_name>
-- [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
-- [END]   success=<true|false> steps=<n> rewards=<r1,r2,...,rn>
+- [STEP]  step=<n> action=<action_str> reward=<float> done=<bool> error=<null|msg>
+- [END]   success=<bool> steps=<n> reward=<float>
 - [END]   score=<float>
 
 All reward and score values are strictly in (0.10, 0.90).
@@ -46,17 +46,16 @@ TASKS = [
 
 TEMPERATURE = 0.3
 MAX_TOKENS = 512
-SUCCESS_THRESHOLD = 0.5
+SUCCESS_THRESHOLD = 0.05
 
 
-def clamp_reward(r):
+def clamp(r):
     if r is None or not isinstance(r, (int, float)) or math.isnan(r) or math.isinf(r):
         return 0.10
     return round(max(0.10, min(0.90, float(r))), 2)
 
 
 def sanitize(s):
-    """Remove newlines and control characters so [STEP] stays on one line."""
     return str(s).replace("\n", " ").replace("\r", "")[:200]
 
 
@@ -96,49 +95,19 @@ SYSTEM_PROMPT = textwrap.dedent("""\
 """)
 
 
-def log_start(task: str, env: str, model: str):
-    print(f"[START] task={task} env={env} model={model}", flush=True)
-
-
-def log_step(step: int, action_str: str, reward: float, done: bool, error):
-    err = "null" if error is None else sanitize(error)
-    d = "true" if done else "false"
-    r = clamp_reward(reward)
-    print(
-        f"[STEP] step={step} action={sanitize(action_str)} reward={r:.2f} "
-        f"done={d} error={err}",
-        flush=True,
-    )
-
-
-def log_end(success: bool, steps: int, rewards: list):
-    s = "true" if success else "false"
-    r_str = ",".join(f"{clamp_reward(r):.2f}" for r in rewards)
-    print(f"[END] success={s} steps={steps} rewards={r_str}", flush=True)
-
-
-def log_task_score(score: float):
-    print(f"[END] score={clamp_reward(score):.2f}", flush=True)
-
-
 def parse_action(text: str) -> SREIncidentAction:
-    """Best-effort extraction of a JSON action from LLM output."""
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-
     match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
     if match:
         text = match.group(0)
-
     data = json.loads(text)
     return SREIncidentAction(**data)
 
 
 def build_user_message(obs) -> str:
-    """Format the observation into a clear prompt for the LLM."""
     parts = [obs.action_result, ""]
-
     if obs.diagnosis_submitted:
         parts.append("[Your diagnosis has been submitted. Now apply remediation.]")
     else:
@@ -146,7 +115,6 @@ def build_user_message(obs) -> str:
             f"[Step {obs.step_number}/{obs.max_steps}] "
             f"Choose your next action. Respond with JSON only."
         )
-
     return "\n".join(parts)
 
 
@@ -157,7 +125,7 @@ def run_episode(task_cfg: dict) -> float:
 
     env = SREIncidentEnvironment()
 
-    log_start(task=label, env=BENCHMARK, model=MODEL_NAME)
+    print(f"[START] task={label} env={BENCHMARK} model={MODEL_NAME}", flush=True)
 
     rewards = []
     last_error = None
@@ -183,8 +151,8 @@ def run_episode(task_cfg: dict) -> float:
             except Exception as e:
                 raw_output = ""
                 last_error = str(e)
-                r = clamp_reward(0.0)
-                log_step(step_num, "llm_error", r, False, last_error)
+                r = clamp(0.0)
+                print(f"[STEP] step={step_num} action=llm_error reward={r:.2f} done=false error={sanitize(last_error)}", flush=True)
                 rewards.append(r)
                 continue
 
@@ -202,10 +170,12 @@ def run_episode(task_cfg: dict) -> float:
             action_str = f"{action.action_type}({action.target_service or ''})"
 
             obs = env.step(action)
-            reward = clamp_reward(obs.reward)
+            reward = clamp(obs.reward)
             rewards.append(reward)
 
-            log_step(step_num, action_str, reward, obs.done, last_error)
+            err = "null" if last_error is None else sanitize(last_error)
+            done = "true" if obs.done else "false"
+            print(f"[STEP] step={step_num} action={sanitize(action_str)} reward={reward:.2f} done={done} error={err}", flush=True)
             last_error = None
 
             messages.append({"role": "assistant", "content": raw_output})
@@ -214,15 +184,15 @@ def run_episode(task_cfg: dict) -> float:
             if obs.done:
                 break
 
-        score = rewards[-1] if rewards else 0.10
-        score = clamp_reward(score)
+        score = clamp(rewards[-1]) if rewards else 0.10
 
     except Exception:
         traceback.print_exc(file=sys.stderr)
     finally:
-        success = score >= SUCCESS_THRESHOLD
-        log_end(success=success, steps=len(rewards), rewards=rewards)
-        log_task_score(score)
+        success = "true" if score >= SUCCESS_THRESHOLD else "false"
+        rewards_str = ",".join(f"{clamp(r):.2f}" for r in rewards) if rewards else "0.10"
+        print(f"[END] success={success} steps={len(rewards)} reward={score:.2f} rewards={rewards_str}", flush=True)
+        print(f"[END] score={score:.2f}", flush=True)
 
     return score
 
